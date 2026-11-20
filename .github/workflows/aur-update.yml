@@ -10,7 +10,8 @@ name: Update AUR package
 #     与仓库里的 .nvchecker.toml 使用同一数据源。
 #   - 更新后在 Arch 容器中重新生成 .SRCINFO，并分别构建 x86_64 / aarch64 包；
 #     任何一步失败都不会提交或推送。
-#   - 构建通过后同时推送到 AUR 和当前 GitHub 仓库，保持镜像同步。
+#   - AUR 的 git hook 不允许子目录，因此推送到 AUR 的是只含 PKGBUILD/.SRCINFO
+#     等根目录文件的独立提交；.github/ 和 README 仅保留在 GitHub。
 
 on:
   schedule:
@@ -109,19 +110,35 @@ jobs:
 
       - name: Push to AUR
         if: steps.upstream.outputs.updated == 'true' && inputs.dry_run != true
+        env:
+          NEWVER: ${{ steps.upstream.outputs.pkgver }}
         run: |
           set -euo pipefail
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519"
-          git remote add aur "ssh://aur@aur.archlinux.org/${PKGNAME}.git" 2>/dev/null ||
-            git remote set-url aur "ssh://aur@aur.archlinux.org/${PKGNAME}.git"
-          git fetch --no-tags aur "+refs/heads/${AUR_BRANCH}:refs/remotes/aur/${AUR_BRANCH}"
-          if [ "$(git rev-parse HEAD^{tree})" = "$(git rev-parse "refs/remotes/aur/${AUR_BRANCH}^{tree}")" ]; then
-            # AUR 已经是同样内容（例如上一次 AUR 推送成功但 GitHub 回推失败）。
-            # 对齐到 AUR 的提交，避免两边历史无谓分叉。
-            echo "AUR already contains this tree; aligning local HEAD with AUR"
-            git reset --hard "refs/remotes/aur/${AUR_BRANCH}"
+
+          aur_dir="$(mktemp -d)"
+          trap 'rm -rf "$aur_dir"' EXIT
+          git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" "$aur_dir"
+
+          # AUR 的 git hook 不允许仓库里出现子目录。这里只同步根目录文件，
+          # .github/ 和 README 只保留在 GitHub，避免被 AUR 拒绝。
+          find "$aur_dir" -mindepth 1 -maxdepth 1 -type d ! -name .git -exec rm -rf {} +
+          for f in PKGBUILD .SRCINFO .gitignore .nvchecker.toml; do
+            if [ -f "$f" ]; then
+              cp "$f" "$aur_dir/$f"
+            fi
+          done
+
+          cd "$aur_dir"
+          git config user.name "Ganyu_Genshin"
+          git config user.email "XianYuPigeon@outlook.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "AUR already up to date"
           else
-            git push aur "HEAD:${AUR_BRANCH}"
+            git commit -m "upgpkg: ${PKGNAME} ${NEWVER}-1"
+            git push origin "HEAD:${AUR_BRANCH}"
           fi
 
       - name: Push mirror to GitHub
